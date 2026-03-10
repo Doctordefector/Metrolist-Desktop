@@ -6,6 +6,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.PlaylistAdd
 import androidx.compose.material.icons.automirrored.filled.PlaylistPlay
 import androidx.compose.material.icons.automirrored.filled.QueueMusic
 import androidx.compose.material.icons.filled.*
@@ -26,6 +27,7 @@ import com.metrolist.music.desktop.db.Artist
 import com.metrolist.music.desktop.db.Playlist
 import com.metrolist.music.desktop.download.DownloadManager
 import com.metrolist.music.desktop.download.DownloadStatus
+import com.metrolist.music.desktop.ui.components.PlaylistPickerDialog
 import com.metrolist.music.desktop.media.suppressMediaKeys
 import com.metrolist.music.desktop.playback.DesktopPlayer
 import com.metrolist.music.desktop.playback.SongInfo
@@ -208,11 +210,11 @@ fun LibraryScreen(
 
         // Content
         when (selectedTab) {
-            LibraryTab.Songs -> SongsTab(librarySongs, likedSongs, player, artistNamesMap, searchQuery, sortMode, sortAscending)
+            LibraryTab.Songs -> SongsTab(librarySongs, likedSongs, player, artistNamesMap, searchQuery, sortMode, sortAscending, playlists)
             LibraryTab.Albums -> AlbumsTab(albums, onAlbumClick, searchQuery, sortMode, sortAscending)
             LibraryTab.Artists -> ArtistsTab(artists, onArtistClick, searchQuery, sortMode, sortAscending)
             LibraryTab.Playlists -> PlaylistsTab(playlists, onPlaylistClick, searchQuery)
-            LibraryTab.Downloads -> DownloadsTab(downloadedSongs, activeDownloads, player, artistNamesMap, searchQuery)
+            LibraryTab.Downloads -> DownloadsTab(downloadedSongs, activeDownloads, player, artistNamesMap, searchQuery, playlists)
         }
     }
 }
@@ -255,7 +257,8 @@ private fun SongsTab(
     artistNamesMap: Map<String, String>,
     searchQuery: String,
     sortMode: SortMode,
-    sortAscending: Boolean
+    sortAscending: Boolean,
+    playlists: List<Playlist> = emptyList()
 ) {
     val scope = rememberCoroutineScope()
     val playerState by player.state.collectAsState()
@@ -365,6 +368,7 @@ private fun SongsTab(
                             song = song,
                             isPlaying = playerState.currentSong?.id == song.id,
                             isDownloaded = DownloadManager.isDownloaded(song.id),
+                            playlists = playlists,
                             onClick = {
                                 scope.launch {
                                     player.playSong(song)
@@ -394,6 +398,7 @@ private fun SongsTab(
                             isPlaying = playerState.currentSong?.id == song.id,
                             isDownloaded = dbSong.isDownloaded == 1L,
                             isLiked = dbSong.liked == 1L,
+                            playlists = playlists,
                             onClick = {
                                 scope.launch {
                                     player.playSong(song)
@@ -421,6 +426,7 @@ private fun SongListItem(
     isPlaying: Boolean,
     isDownloaded: Boolean = false,
     isLiked: Boolean = false,
+    playlists: List<Playlist> = emptyList(),
     onClick: () -> Unit,
     onDownload: () -> Unit = {},
     onToggleLike: () -> Unit = {},
@@ -428,6 +434,7 @@ private fun SongListItem(
     onAddToQueue: () -> Unit = {}
 ) {
     var showMenu by remember { mutableStateOf(false) }
+    var showPlaylistPicker by remember { mutableStateOf(false) }
 
     ListItem(
         headlineContent = {
@@ -515,6 +522,16 @@ private fun SongListItem(
                             },
                             leadingIcon = { Icon(Icons.AutoMirrored.Filled.QueueMusic, null) }
                         )
+                        if (playlists.isNotEmpty()) {
+                            DropdownMenuItem(
+                                text = { Text("Add to Playlist") },
+                                onClick = {
+                                    showMenu = false
+                                    showPlaylistPicker = true
+                                },
+                                leadingIcon = { Icon(Icons.AutoMirrored.Filled.PlaylistAdd, null) }
+                            )
+                        }
                         HorizontalDivider()
                         DropdownMenuItem(
                             text = { Text(if (isLiked) "Unlike" else "Like") },
@@ -554,6 +571,14 @@ private fun SongListItem(
         },
         modifier = Modifier.clickable(onClick = onClick)
     )
+
+    if (showPlaylistPicker) {
+        PlaylistPickerDialog(
+            song = song,
+            playlists = playlists,
+            onDismiss = { showPlaylistPicker = false }
+        )
+    }
 }
 
 @Composable
@@ -740,7 +765,8 @@ private fun DownloadsTab(
     activeDownloads: Map<String, com.metrolist.music.desktop.download.DownloadProgress>,
     player: DesktopPlayer,
     artistNamesMap: Map<String, String>,
-    searchQuery: String
+    searchQuery: String,
+    playlists: List<Playlist> = emptyList()
 ) {
     val scope = rememberCoroutineScope()
     val playerState by player.state.collectAsState()
@@ -843,6 +869,7 @@ private fun DownloadsTab(
                         song = song,
                         isPlaying = playerState.currentSong?.id == song.id,
                         isDownloaded = true,
+                        playlists = playlists,
                         onClick = {
                             scope.launch {
                                 val localPath = dbSong.localPath

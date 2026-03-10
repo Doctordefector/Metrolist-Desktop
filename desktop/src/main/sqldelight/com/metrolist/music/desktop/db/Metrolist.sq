@@ -146,23 +146,38 @@ CREATE INDEX event_timestamp_idx ON Event(timestamp);
 
 -- Song queries
 getAllSongs:
-SELECT *, _rowid_ AS rowOrder FROM Song WHERE inLibrary IS NOT NULL ORDER BY inLibrary DESC, rowOrder DESC;
+SELECT *, _rowid_ AS rowOrder FROM Song WHERE inLibrary IS NOT NULL ORDER BY inLibrary DESC, rowOrder ASC;
 
 getLikedSongs:
-SELECT *, _rowid_ AS rowOrder FROM Song WHERE liked = 1 ORDER BY likedDate DESC, rowOrder DESC;
+SELECT *, _rowid_ AS rowOrder FROM Song WHERE liked = 1 ORDER BY likedDate DESC, rowOrder ASC;
 
 getDownloadedSongs:
-SELECT *, _rowid_ AS rowOrder FROM Song WHERE isDownloaded = 1 ORDER BY dateDownload DESC, rowOrder DESC;
+SELECT *, _rowid_ AS rowOrder FROM Song WHERE isDownloaded = 1 ORDER BY dateDownload DESC, rowOrder ASC;
 
 getSongById:
 SELECT * FROM Song WHERE id = ?;
+
+getSongLocalPath:
+SELECT localPath FROM Song WHERE id = ? AND isDownloaded = 1;
 
 getSongsByAlbum:
 SELECT * FROM Song WHERE albumId = ? ORDER BY id;
 
 insertSong:
-INSERT OR REPLACE INTO Song(id, title, duration, thumbnailUrl, albumId, albumName, explicit, year, liked, likedDate, totalPlayTime, inLibrary, dateDownload, isLocal, isDownloaded, localPath)
+INSERT OR IGNORE INTO Song(id, title, duration, thumbnailUrl, albumId, albumName, explicit, year, liked, likedDate, totalPlayTime, inLibrary, dateDownload, isLocal, isDownloaded, localPath)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+
+updateSongMetadata:
+UPDATE Song SET
+    title = ?,
+    duration = ?,
+    thumbnailUrl = COALESCE(?, thumbnailUrl),
+    albumId = COALESCE(?, albumId),
+    albumName = COALESCE(?, albumName),
+    explicit = ?,
+    year = ?,
+    inLibrary = COALESCE(?, inLibrary)
+WHERE id = ?;
 
 updateSongLiked:
 UPDATE Song SET liked = ?, likedDate = ? WHERE id = ?;
@@ -245,6 +260,9 @@ ORDER BY PlaylistSongMap.position;
 
 getPlaylistSongCount:
 SELECT COUNT(*) FROM PlaylistSongMap WHERE playlistId = ?;
+
+isSongInPlaylist:
+SELECT COUNT(*) FROM PlaylistSongMap WHERE playlistId = ? AND songId = ?;
 
 insertPlaylistSong:
 INSERT OR REPLACE INTO PlaylistSongMap(playlistId, songId, position)

@@ -529,9 +529,23 @@ fun SettingsScreen(
             }
         }
 
-        // Notifications section
+        // System section
         item {
-            SettingsSectionHeader("Notifications")
+            SettingsSectionHeader("System")
+        }
+
+        item {
+            SettingsItem(
+                icon = Icons.Default.DesktopWindows,
+                title = "Minimize to Tray on Close",
+                subtitle = "Keep running in the system tray when the window is closed",
+                trailing = {
+                    Switch(
+                        checked = preferences.minimizeToTray,
+                        onCheckedChange = { PreferencesManager.setMinimizeToTray(it) }
+                    )
+                }
+            )
         }
 
         item {

@@ -7,13 +7,16 @@ import com.metrolist.music.desktop.playback.SongInfo
 import com.metrolist.music.desktop.settings.PreferencesManager
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
+import okhttp3.OkHttpClient
+import okhttp3.Request
 import timber.log.Timber
 import java.io.File
 import java.io.FileOutputStream
-import java.net.HttpURLConnection
-import java.net.URL
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
+import java.util.concurrent.TimeUnit
 
 data class DownloadProgress(
     val songId: String,
@@ -34,6 +37,10 @@ enum class DownloadStatus {
 object DownloadManager {
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
+    /** Max concurrent downloads — matches Android Metrolist's maxParallelDownloads */
+    private const val MAX_PARALLEL_DOWNLOADS = 3
+    private val downloadSemaphore = Semaphore(MAX_PARALLEL_DOWNLOADS)
+
     private val _activeDownloads = MutableStateFlow<Map<String, DownloadProgress>>(emptyMap())
     val activeDownloads: StateFlow<Map<String, DownloadProgress>> = _activeDownloads.asStateFlow()
 
@@ -43,6 +50,13 @@ object DownloadManager {
     private var isProcessing = false
     private val downloadJobs = mutableMapOf<String, Job>()
 
+    /** Shared OkHttp client with connection pooling for fast downloads */
+    private val httpClient = OkHttpClient.Builder()
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(30, TimeUnit.SECONDS)
+        .followRedirects(true)
+        .build()
+
     private val downloadDir: File
         get() {
             val dir = PreferencesManager.getDownloadDirectory()
@@ -50,19 +64,55 @@ object DownloadManager {
             return dir
         }
 
-    fun getDownloadPath(songId: String): File {
-        return File(downloadDir, "$songId.m4a")
+    /**
+     * Generate a download file path using "Artist - Title.m4a" naming.
+     * Falls back to songId.m4a if artist/title are unavailable.
+     * Handles filename conflicts by appending (2), (3), etc.
+     */
+    fun getDownloadPath(song: SongInfo): File {
+        val baseName = sanitizeFilename("${song.artist} - ${song.title}")
+        var candidate = File(downloadDir, "$baseName.m4a")
+        var counter = 2
+        while (candidate.exists() && !isSameSong(candidate, song.id)) {
+            candidate = File(downloadDir, "$baseName ($counter).m4a")
+            counter++
+        }
+        return candidate
+    }
+
+    /** Legacy path lookup by songId — checks DB localPath first, then old songId.m4a format. */
+    fun getDownloadPathById(songId: String): File? {
+        val dbPath: String? = DatabaseHelper.getSongLocalPath(songId)
+        if (dbPath != null) {
+            val f = File(dbPath)
+            if (f.exists()) return f
+        }
+        // Fallback: old naming scheme
+        val legacyFile = File(downloadDir, "$songId.m4a")
+        if (legacyFile.exists()) return legacyFile
+        return null
     }
 
     fun isDownloaded(songId: String): Boolean {
-        return getDownloadPath(songId).exists()
+        return getDownloadPathById(songId) != null
+    }
+
+    private fun sanitizeFilename(name: String): String {
+        return name.replace(Regex("[\\\\/:*?\"<>|]"), "_")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+            .take(200)
+            .ifBlank { "Unknown" }
+    }
+
+    private fun isSameSong(file: File, songId: String): Boolean {
+        val dbPath: String = DatabaseHelper.getSongLocalPath(songId) ?: return false
+        return File(dbPath).absolutePath == file.absolutePath
     }
 
     fun queueDownload(song: SongInfo) {
-        // Add to database queue
         DatabaseHelper.addToDownloadQueue(song.id)
 
-        // Also save song info to database if not exists
         DatabaseHelper.insertSong(
             id = song.id,
             title = song.title,
@@ -71,14 +121,12 @@ object DownloadManager {
             albumName = song.album
         )
 
-        // Add to in-memory queue
         _downloadQueue.update { queue ->
             if (queue.none { it.id == song.id }) {
                 queue + song
             } else queue
         }
 
-        // Update progress state
         _activeDownloads.update { downloads ->
             downloads + (song.id to DownloadProgress(
                 songId = song.id,
@@ -88,7 +136,6 @@ object DownloadManager {
             ))
         }
 
-        // Start processing if not already
         if (!isProcessing) {
             processQueue()
         }
@@ -127,88 +174,152 @@ object DownloadManager {
     }
 
     fun deleteDownload(songId: String) {
-        val file = getDownloadPath(songId)
-        if (file.exists()) {
+        val file = getDownloadPathById(songId)
+        if (file != null && file.exists()) {
             file.delete()
         }
         DatabaseHelper.updateSongDownloaded(songId, false, null)
     }
 
+    /**
+     * Process the download queue with up to MAX_PARALLEL_DOWNLOADS concurrent downloads.
+     * Uses a semaphore to limit concurrency while launching all queued items immediately.
+     */
     private fun processQueue() {
         if (isProcessing) return
         isProcessing = true
 
         scope.launch {
+            // Keep launching downloads as long as there are items in the queue
             while (_downloadQueue.value.isNotEmpty()) {
-                val song = _downloadQueue.value.firstOrNull() ?: break
-
-                // Update status to downloading
-                _activeDownloads.update { downloads ->
-                    downloads + (song.id to DownloadProgress(
-                        songId = song.id,
-                        songTitle = song.title,
-                        progress = 0,
-                        status = DownloadStatus.DOWNLOADING
-                    ))
+                // Take all pending songs and launch them concurrently (semaphore limits actual parallelism)
+                val pendingSongs = _downloadQueue.value.filter { song ->
+                    !downloadJobs.containsKey(song.id)
                 }
-                DatabaseHelper.updateDownloadProgress(song.id, 0, "downloading")
 
-                val job = launch {
-                    try {
-                        downloadSong(song)
-                    } catch (e: CancellationException) {
-                        // Download was cancelled
-                        _activeDownloads.update { downloads ->
-                            downloads + (song.id to DownloadProgress(
-                                songId = song.id,
-                                songTitle = song.title,
-                                progress = 0,
-                                status = DownloadStatus.CANCELLED
-                            ))
+                if (pendingSongs.isEmpty()) {
+                    // All queued songs already have active jobs — wait for one to finish
+                    delay(200)
+                    continue
+                }
+
+                for (song in pendingSongs) {
+                    val job = launch {
+                        downloadSemaphore.withPermit {
+                            _activeDownloads.update { downloads ->
+                                downloads + (song.id to DownloadProgress(
+                                    songId = song.id,
+                                    songTitle = song.title,
+                                    progress = 0,
+                                    status = DownloadStatus.DOWNLOADING
+                                ))
+                            }
+                            DatabaseHelper.updateDownloadProgress(song.id, 0, "downloading")
+
+                            try {
+                                downloadSong(song)
+                            } catch (e: CancellationException) {
+                                _activeDownloads.update { downloads ->
+                                    downloads + (song.id to DownloadProgress(
+                                        songId = song.id,
+                                        songTitle = song.title,
+                                        progress = 0,
+                                        status = DownloadStatus.CANCELLED
+                                    ))
+                                }
+                            } catch (e: Exception) {
+                                handleDownloadError(song, e.message ?: "Unknown error")
+                            } finally {
+                                downloadJobs.remove(song.id)
+                                _downloadQueue.update { queue ->
+                                    queue.filter { it.id != song.id }
+                                }
+                            }
                         }
-                    } catch (e: Exception) {
-                        handleDownloadError(song, e.message ?: "Unknown error")
                     }
+                    downloadJobs[song.id] = job
                 }
 
-                downloadJobs[song.id] = job
-                job.join()
-                downloadJobs.remove(song.id)
-
-                // Remove from queue
-                _downloadQueue.update { queue ->
-                    queue.filter { it.id != song.id }
-                }
+                // Wait for all current batch jobs to complete before checking for more
+                downloadJobs.values.toList().forEach { it.join() }
             }
 
             isProcessing = false
         }
     }
 
-    private suspend fun downloadSong(song: SongInfo) {
-        // Get stream URL
-        val streamUrl = getStreamUrl(song.id) ?: throw Exception("Failed to get stream URL")
+    /**
+     * Resolve stream URL and content length for a video.
+     * Tries clients in order matching Android Metrolist: WEB_REMIX first, then fallbacks.
+     * Returns the URL with &range= appended (bypasses YouTube throttling) and content length.
+     */
+    private data class StreamInfo(val url: String, val contentLength: Long)
 
-        val outputFile = getDownloadPath(song.id)
+    private suspend fun getStreamInfo(videoId: String): StreamInfo? {
+        // Client order: WEB_REMIX first (like Android), then fallbacks
+        val clients = listOf(
+            YouTubeClient.WEB_REMIX,
+            YouTubeClient.ANDROID_VR_NO_AUTH,
+            YouTubeClient.IOS
+        )
+
+        for (client in clients) {
+            try {
+                val playerResponse = YouTube.player(videoId, client = client).getOrNull()
+                val format = playerResponse?.streamingData?.adaptiveFormats
+                    ?.filter { it.isAudio }
+                    ?.maxByOrNull { it.bitrate }
+
+                if (format?.url != null) {
+                    val contentLength = format.contentLength ?: 0L
+                    // Append range parameter like Android does — bypasses YouTube CDN throttling
+                    val url = if (contentLength > 0) {
+                        "${format.url}&range=0-$contentLength"
+                    } else {
+                        format.url
+                    }
+                    Timber.d("Stream resolved via ${client.clientName}: contentLength=$contentLength")
+                    return StreamInfo(url, contentLength)
+                }
+            } catch (e: Exception) {
+                Timber.d("Client ${client.clientName} failed for $videoId: ${e.message}")
+                continue
+            }
+        }
+        return null
+    }
+
+    private suspend fun downloadSong(song: SongInfo) {
+        Timber.d("Downloading song: id=${song.id}, artist=${song.artist}, title=${song.title}")
+
+        val streamInfo = getStreamInfo(song.id) ?: throw Exception("Failed to get stream URL")
+
+        val outputFile = getDownloadPath(song)
         val tempFile = File(downloadDir, "${song.id}.tmp")
+        Timber.d("Download output: ${outputFile.absolutePath}")
 
         try {
-            val url = URL(streamUrl)
-            val connection = url.openConnection() as HttpURLConnection
-            connection.requestMethod = "GET"
-            connection.connectTimeout = 30000
-            connection.readTimeout = 30000
-            // Some YouTube CDN endpoints need a user-agent
-            connection.setRequestProperty("User-Agent", "Mozilla/5.0")
+            val request = Request.Builder()
+                .url(streamInfo.url)
+                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36")
+                .build()
 
-            val totalSize = connection.contentLengthLong
+            val response = httpClient.newCall(request).execute()
+            if (!response.isSuccessful) {
+                response.close()
+                throw Exception("HTTP ${response.code}")
+            }
+
+            val body = response.body!!
+            // Use content length from format metadata (more reliable) or fall back to HTTP header
+            val totalSize = if (streamInfo.contentLength > 0) streamInfo.contentLength else body.contentLength()
             var downloadedSize = 0L
             var lastProgressUpdate = 0
 
-            connection.inputStream.buffered(262144).use { input ->
+            body.byteStream().buffered(524288).use { input ->
                 FileOutputStream(tempFile).use { fos ->
-                    val output = fos.buffered(262144) // 256KB write buffer
-                    val buffer = ByteArray(65536) // 64KB read chunks
+                    val output = fos.buffered(524288) // 512KB write buffer
+                    val buffer = ByteArray(131072) // 128KB read chunks (2x previous)
                     var bytesRead: Int
 
                     while (input.read(buffer).also { bytesRead = it } != -1) {
@@ -221,7 +332,6 @@ object DownloadManager {
                             -1
                         }
 
-                        // Only update UI/DB when progress changes by at least 1%
                         if (progress != lastProgressUpdate) {
                             lastProgressUpdate = progress
                             _activeDownloads.update { downloads ->
@@ -232,27 +342,24 @@ object DownloadManager {
                                     status = DownloadStatus.DOWNLOADING
                                 ))
                             }
-                            // Only write to DB every 5%
                             if (progress % 5 == 0) {
                                 DatabaseHelper.updateDownloadProgress(song.id, progress, "downloading")
                             }
                         }
 
-                        // Check for cancellation periodically
                         yield()
                     }
                     output.flush()
                 }
             }
 
-            // Move temp file to final location (renameTo fails silently on Windows)
+            response.close()
+
             Files.move(tempFile.toPath(), outputFile.toPath(), StandardCopyOption.REPLACE_EXISTING)
 
-            // Update database
             DatabaseHelper.updateSongDownloaded(song.id, true, outputFile.absolutePath)
             DatabaseHelper.removeFromDownloadQueue(song.id)
 
-            // Update status
             _activeDownloads.update { downloads ->
                 downloads + (song.id to DownloadProgress(
                     songId = song.id,
@@ -262,7 +369,6 @@ object DownloadManager {
                 ))
             }
 
-            // Remove from active downloads after a delay
             delay(2000)
             _activeDownloads.update { downloads ->
                 downloads - song.id
@@ -272,30 +378,6 @@ object DownloadManager {
             tempFile.delete()
             throw e
         }
-    }
-
-    private suspend fun getStreamUrl(videoId: String): String? {
-        val clients = listOf(
-            YouTubeClient.ANDROID_VR_NO_AUTH,
-            YouTubeClient.IOS,
-            YouTubeClient.WEB_REMIX
-        )
-
-        for (client in clients) {
-            try {
-                val playerResponse = YouTube.player(videoId, client = client).getOrNull()
-                val format = playerResponse?.streamingData?.adaptiveFormats
-                    ?.filter { it.isAudio }
-                    ?.maxByOrNull { it.bitrate ?: 0 }
-
-                if (format?.url != null) {
-                    return format.url
-                }
-            } catch (e: Exception) {
-                continue
-            }
-        }
-        return null
     }
 
     private fun handleDownloadError(song: SongInfo, error: String) {
@@ -312,12 +394,9 @@ object DownloadManager {
     }
 
     fun retryDownload(song: SongInfo) {
-        // Remove from error state
         _activeDownloads.update { downloads ->
             downloads - song.id
         }
-
-        // Re-queue
         queueDownload(song)
     }
 }

@@ -35,6 +35,7 @@ data class AppPreferences(
     val lastFmSessionKey: String? = null,
     val lastFmUsername: String? = null,
     val notificationsEnabled: Boolean = true,
+    val minimizeToTray: Boolean = true,
     val volume: Float = 1f,
     val isMuted: Boolean = false,
     val volumeBeforeMute: Float = 1f,
@@ -82,6 +83,7 @@ object PreferencesManager {
                     lastFmSessionKey = props.getProperty("lastFmSessionKey"),
                     lastFmUsername = props.getProperty("lastFmUsername"),
                     notificationsEnabled = props.getProperty("notificationsEnabled")?.toBoolean() ?: true,
+                    minimizeToTray = props.getProperty("minimizeToTray")?.toBoolean() ?: true,
                     volume = props.getProperty("volume")?.toFloatOrNull()?.coerceIn(0f, 1f) ?: 1f,
                     isMuted = props.getProperty("isMuted")?.toBoolean() ?: false,
                     volumeBeforeMute = props.getProperty("volumeBeforeMute")?.toFloatOrNull()?.coerceIn(0f, 1f) ?: 1f,
@@ -119,6 +121,7 @@ object PreferencesManager {
             prefs.lastFmSessionKey?.let { props.setProperty("lastFmSessionKey", it) }
             prefs.lastFmUsername?.let { props.setProperty("lastFmUsername", it) }
             props.setProperty("notificationsEnabled", prefs.notificationsEnabled.toString())
+            props.setProperty("minimizeToTray", prefs.minimizeToTray.toString())
             props.setProperty("volume", prefs.volume.toString())
             props.setProperty("isMuted", prefs.isMuted.toString())
             props.setProperty("volumeBeforeMute", prefs.volumeBeforeMute.toString())
@@ -202,6 +205,11 @@ object PreferencesManager {
 
     fun setNotificationsEnabled(enabled: Boolean) {
         _preferences.value = _preferences.value.copy(notificationsEnabled = enabled)
+        savePreferences()
+    }
+
+    fun setMinimizeToTray(enabled: Boolean) {
+        _preferences.value = _preferences.value.copy(minimizeToTray = enabled)
         savePreferences()
     }
 

@@ -49,6 +49,7 @@ fun main() {
     application {
         val windowState = rememberWindowState(width = 1200.dp, height = 800.dp)
         val player = remember { DesktopPlayer() }
+        var windowVisible by remember { mutableStateOf(true) }
 
         // Initialize VLC, auth, media keys, queue restore, and integrations off the main thread
         LaunchedEffect(player) {
@@ -65,6 +66,19 @@ fun main() {
             DiscordRPC.initialize(player)
             LastFmManager.initialize(player)
             DesktopNotification.initialize(player)
+
+            // Set up tray callbacks for minimize-to-tray
+            DesktopNotification.onShowWindow = {
+                windowVisible = true
+            }
+            DesktopNotification.onExitApp = {
+                DesktopNotification.release()
+                LastFmManager.release()
+                DiscordRPC.release()
+                MediaKeyHandler.release()
+                player.release()
+                exitApplication()
+            }
         }
 
         val prefs by PreferencesManager.preferences.collectAsState()
@@ -77,13 +91,20 @@ fun main() {
 
         Window(
             onCloseRequest = {
-                DesktopNotification.release()
-                LastFmManager.release()
-                DiscordRPC.release()
-                MediaKeyHandler.release()
-                player.release()
-                exitApplication()
+                if (prefs.minimizeToTray) {
+                    // Minimize to tray instead of exiting
+                    windowVisible = false
+                } else {
+                    // Actually exit
+                    DesktopNotification.release()
+                    LastFmManager.release()
+                    DiscordRPC.release()
+                    MediaKeyHandler.release()
+                    player.release()
+                    exitApplication()
+                }
             },
+            visible = windowVisible,
             title = windowTitle,
             state = windowState,
             icon = appIcon,

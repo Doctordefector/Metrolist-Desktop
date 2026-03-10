@@ -120,6 +120,9 @@ object DatabaseHelper {
     fun getSongById(id: String) =
         queries.getSongById(id).asFlow().mapToOneOrNull(Dispatchers.IO)
 
+    fun getSongLocalPath(songId: String): String? =
+        queries.getSongLocalPath(songId).executeAsOneOrNull()?.localPath
+
     fun getSongsByAlbum(albumId: String) =
         queries.getSongsByAlbum(albumId).asFlow().mapToList(Dispatchers.IO)
 
@@ -141,6 +144,7 @@ object DatabaseHelper {
         isDownloaded: Boolean = false,
         localPath: String? = null
     ) {
+        // INSERT OR IGNORE: only inserts if song doesn't exist yet
         queries.insertSong(
             id = id,
             title = title,
@@ -158,6 +162,18 @@ object DatabaseHelper {
             isLocal = if (isLocal) 1L else 0L,
             isDownloaded = if (isDownloaded) 1L else 0L,
             localPath = localPath
+        )
+        // Update metadata for existing songs (preserves download/liked state)
+        queries.updateSongMetadata(
+            title = title,
+            duration = duration.toLong(),
+            value = thumbnailUrl,
+            value_ = albumId,
+            value__ = albumName,
+            explicit = if (explicit) 1L else 0L,
+            year = year?.toLong(),
+            value___ = inLibrary,
+            id = id
         )
     }
 
@@ -311,6 +327,14 @@ object DatabaseHelper {
 
     fun addSongToPlaylist(playlistId: String, songId: String, position: Int) {
         queries.insertPlaylistSong(playlistId, songId, position.toLong())
+    }
+
+    fun isSongInPlaylist(playlistId: String, songId: String): Boolean {
+        return queries.isSongInPlaylist(playlistId, songId).executeAsOne() > 0
+    }
+
+    fun getPlaylistSongCount(playlistId: String): Int {
+        return queries.getPlaylistSongCount(playlistId).executeAsOne().toInt()
     }
 
     fun removeSongFromPlaylist(playlistId: String, songId: String) {

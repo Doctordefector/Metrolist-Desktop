@@ -282,45 +282,10 @@ fun MiniPlayer(
 
     // Playlist picker dialog
     if (showPlaylistPicker) {
-        AlertDialog(
-            onDismissRequest = { showPlaylistPicker = false },
-            title = { Text("Add to Playlist") },
-            text = {
-                if (playlists.isEmpty()) {
-                    Text("No playlists available")
-                } else {
-                    Column {
-                        playlists.forEach { playlist ->
-                            ListItem(
-                                headlineContent = { Text(playlist.name) },
-                                supportingContent = {
-                                    Text("${playlist.remoteSongCount ?: 0} songs")
-                                },
-                                leadingContent = {
-                                    Icon(Icons.AutoMirrored.Filled.PlaylistAdd, null)
-                                },
-                                modifier = Modifier.clickable {
-                                    // Ensure song exists in DB, then add to playlist
-                                    DatabaseHelper.insertSong(
-                                        id = song.id,
-                                        title = song.title,
-                                        thumbnailUrl = song.thumbnailUrl,
-                                        albumName = song.album
-                                    )
-                                    val count = playlist.remoteSongCount?.toInt() ?: 0
-                                    DatabaseHelper.addSongToPlaylist(playlist.id, song.id, count)
-                                    showPlaylistPicker = false
-                                }
-                            )
-                        }
-                    }
-                }
-            },
-            confirmButton = {
-                TextButton(onClick = { showPlaylistPicker = false }) {
-                    Text("Cancel")
-                }
-            }
+        PlaylistPickerDialog(
+            song = song,
+            playlists = playlists,
+            onDismiss = { showPlaylistPicker = false }
         )
     }
 }
