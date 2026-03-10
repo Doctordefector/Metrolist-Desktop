@@ -24,6 +24,12 @@ import com.metrolist.music.desktop.playback.SongInfo
 import kotlinx.coroutines.launch
 import timber.log.Timber
 
+/** Simple in-memory cache for the home feed to avoid re-fetching on every navigation */
+private object HomeFeedCache {
+    var cachedPage: HomePage? = null
+    var cachedForLogin: Boolean? = null
+}
+
 @Composable
 fun HomeScreen(
     player: DesktopPlayer,
@@ -33,22 +39,34 @@ fun HomeScreen(
     onPodcastClick: (String) -> Unit = {}
 ) {
     val scope = rememberCoroutineScope()
-    var homePage by remember { mutableStateOf<HomePage?>(null) }
-    var isLoading by remember { mutableStateOf(true) }
+    var homePage by remember { mutableStateOf(HomeFeedCache.cachedPage) }
+    var isLoading by remember { mutableStateOf(HomeFeedCache.cachedPage == null) }
     var error by remember { mutableStateOf<String?>(null) }
     val authState by AuthManager.authState.collectAsState()
 
-    // Re-fetch when auth state changes (e.g. after login)
+    // Re-fetch when auth state changes (e.g. after login) or if no cache
     LaunchedEffect(authState.isLoggedIn) {
+        // Use cache if available and login state hasn't changed
+        if (HomeFeedCache.cachedPage != null && HomeFeedCache.cachedForLogin == authState.isLoggedIn) {
+            homePage = HomeFeedCache.cachedPage
+            isLoading = false
+            return@LaunchedEffect
+        }
         try {
-            isLoading = true
+            isLoading = homePage == null // Only show spinner if we have nothing to display
             error = null
             val result = YouTube.home()
             result.onSuccess { page ->
                 var current = page
                 Timber.d("Home: loaded ${current.sections.size} sections")
 
-                // Load continuation pages to get more personalized sections
+                // Show first page immediately while loading continuations
+                homePage = current
+                isLoading = false
+                HomeFeedCache.cachedPage = current
+                HomeFeedCache.cachedForLogin = authState.isLoggedIn
+
+                // Load continuation pages in background for more sections
                 var continuation = current.continuation
                 var attempts = 0
                 while (continuation != null && attempts < 5) {
@@ -59,19 +77,25 @@ fun HomeScreen(
                             sections = (current.sections + contPage.sections).toMutableList()
                         )
                         continuation = contPage.continuation
+                        // Update UI progressively as each continuation loads
+                        homePage = current
+                        HomeFeedCache.cachedPage = current
                     }.onFailure {
                         if (it is kotlinx.coroutines.CancellationException) throw it
                         Timber.w("Home continuation error: ${it.message?.take(100)}")
                         continuation = null
                     }
                 }
-                homePage = current
             }.onFailure { e ->
                 if (e is kotlinx.coroutines.CancellationException) throw e
                 Timber.e("Home error: ${e.message?.take(200)}")
                 error = friendlyErrorMessage(e, "Failed to load home page")
+                isLoading = false
             }
-        } finally {
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            error = friendlyErrorMessage(e, "Failed to load home page")
             isLoading = false
         }
     }

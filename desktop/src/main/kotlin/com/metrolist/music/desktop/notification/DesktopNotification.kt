@@ -27,9 +27,17 @@ object DesktopNotification {
         }
 
         try {
-            val image = Toolkit.getDefaultToolkit().createImage(
-                DesktopNotification::class.java.getResource("/icon.png")
-            ) ?: Toolkit.getDefaultToolkit().createImage(ByteArray(0))
+            // Load icon via ImageIO for synchronous, reliable loading
+            // (Toolkit.createImage is async and may not finish before TrayIcon uses it)
+            val iconStream = Thread.currentThread().contextClassLoader
+                .getResourceAsStream("icon.png")
+                ?: DesktopNotification::class.java.getResourceAsStream("/icon.png")
+            val image = if (iconStream != null) {
+                javax.imageio.ImageIO.read(iconStream)
+            } else {
+                Timber.w("icon.png not found for notification tray icon")
+                Toolkit.getDefaultToolkit().createImage(ByteArray(0))
+            }
 
             trayIcon = TrayIcon(image, "Metrolist").apply {
                 isImageAutoSize = true

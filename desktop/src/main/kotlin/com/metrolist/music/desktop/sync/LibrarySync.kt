@@ -37,35 +37,63 @@ object LibrarySync {
         }
 
         syncJob = scope.launch {
-            _syncState.value = SyncState(isSyncing = true, progress = "Starting sync...")
+            _syncState.value = SyncState(isSyncing = true, progress = "Syncing library...")
 
             try {
-                // Sync liked songs from "LM" (Liked Music) playlist
-                syncLikedSongs()
+                // Phase 1: Fetch all data from YouTube API (network-bound)
+                // Fetch liked songs (requires pagination) and other library types in parallel
+                val songsDeferred = async { fetchAllLikedSongs() }
+                val playlistsDeferred = async { fetchLibraryPlaylists() }
+                val albumsDeferred = async { fetchLibraryAlbums() }
+                val artistsDeferred = async { fetchLibraryArtists() }
 
-                // Sync library playlists
-                syncLibraryPlaylists()
+                _syncState.update { it.copy(progress = "Fetching library from YouTube...") }
 
-                // Sync library albums
-                syncLibraryAlbums()
+                val songs = songsDeferred.await()
+                val playlists = playlistsDeferred.await()
+                val albums = albumsDeferred.await()
+                val artists = artistsDeferred.await()
 
-                // Sync library artists
-                syncLibraryArtists()
+                _syncState.update {
+                    it.copy(progress = "Saving ${songs.size} songs, ${albums.size} albums, ${artists.size} artists, ${playlists.size} playlists...")
+                }
+
+                // Phase 2: Write everything to DB in a single transaction
+                // This means: one disk sync, one flow notification, zero UI flicker
+                DatabaseHelper.transaction {
+                    val now = LocalDateTime.now().toString()
+
+                    songs.forEach { song ->
+                        saveSongToDatabase(song, liked = true, now = now)
+                    }
+
+                    albums.forEach { album ->
+                        saveAlbumToDatabase(album, bookmarked = true, now = now)
+                    }
+
+                    artists.forEach { artist ->
+                        saveArtistToDatabase(artist, subscribed = true, now = now)
+                    }
+
+                    playlists.forEach { playlist ->
+                        savePlaylistToDatabase(playlist, now = now)
+                    }
+                }
 
                 _syncState.value = SyncState(
                     isSyncing = false,
                     lastSyncTime = LocalDateTime.now().toString(),
-                    progress = "Sync complete!"
+                    progress = "Synced ${songs.size} songs, ${albums.size} albums, ${artists.size} artists, ${playlists.size} playlists"
                 )
 
                 // Clear progress message after delay
-                delay(3000)
+                delay(5000)
                 _syncState.update { it.copy(progress = "") }
 
             } catch (e: CancellationException) {
                 _syncState.value = SyncState(progress = "Sync cancelled")
             } catch (e: Exception) {
-                e.printStackTrace()
+                Timber.e("Sync failed: ${e.message}")
                 _syncState.value = SyncState(
                     isSyncing = false,
                     error = "Sync failed: ${e.message}"
@@ -79,26 +107,19 @@ object LibrarySync {
         _syncState.value = SyncState(progress = "Sync cancelled")
     }
 
-    private suspend fun syncLikedSongs() {
-        _syncState.update { it.copy(progress = "Syncing liked songs...") }
+    // ============ Network Fetch (no DB writes) ============
+
+    private suspend fun fetchAllLikedSongs(): List<SongItem> {
+        val allSongs = mutableListOf<SongItem>()
 
         try {
-            // Get the liked music playlist
             val playlistResult = YouTube.playlist("LM")
-            val playlist = playlistResult.getOrNull() ?: return
+            val playlist = playlistResult.getOrNull() ?: return emptyList()
 
-            val songs = playlist.songs
-            var count = 0
+            allSongs.addAll(playlist.songs)
+            _syncState.update { it.copy(progress = "Fetching liked songs... (${allSongs.size})") }
 
-            songs.forEach { song ->
-                saveSongToDatabase(song, liked = true)
-                count++
-            }
-
-            _syncState.update { it.copy(progress = "Synced $count liked songs") }
-
-            // Fetch all remaining pages — songsContinuation is the inner shelf token (primary),
-            // continuation is the outer section token (fallback)
+            // Paginate through all continuation pages
             var continuation = playlist.songsContinuation ?: playlist.continuation
             var pageCount = 1
 
@@ -106,76 +127,51 @@ object LibrarySync {
                 val contResult = YouTube.playlistContinuation(continuation)
                 val contPlaylist = contResult.getOrNull() ?: break
 
-                contPlaylist.songs.forEach { song ->
-                    saveSongToDatabase(song, liked = true)
-                    count++
-                }
-
+                allSongs.addAll(contPlaylist.songs)
                 continuation = contPlaylist.continuation
                 pageCount++
-                _syncState.update { it.copy(progress = "Syncing liked songs... ($count songs)") }
+                _syncState.update { it.copy(progress = "Fetching liked songs... (${allSongs.size})") }
             }
-
         } catch (e: Exception) {
-            Timber.e("Error syncing liked songs: ${e.message}")
+            Timber.e("Error fetching liked songs: ${e.message}")
+        }
+
+        return allSongs
+    }
+
+    private suspend fun fetchLibraryPlaylists(): List<PlaylistItem> {
+        return try {
+            val result = YouTube.library("FEmusic_liked_playlists")
+            result.getOrNull()?.items?.filterIsInstance<PlaylistItem>() ?: emptyList()
+        } catch (e: Exception) {
+            Timber.e("Error fetching playlists: ${e.message}")
+            emptyList()
         }
     }
 
-    private suspend fun syncLibraryPlaylists() {
-        _syncState.update { it.copy(progress = "Syncing playlists...") }
-
-        try {
-            // Fetch library playlists using the library API
-            val libraryResult = YouTube.library("FEmusic_liked_playlists")
-            val library = libraryResult.getOrNull() ?: return
-
-            library.items.filterIsInstance<PlaylistItem>().forEach { playlist ->
-                savePlaylistToDatabase(playlist)
-            }
-
+    private suspend fun fetchLibraryAlbums(): List<AlbumItem> {
+        return try {
+            val result = YouTube.library("FEmusic_liked_albums")
+            result.getOrNull()?.items?.filterIsInstance<AlbumItem>() ?: emptyList()
         } catch (e: Exception) {
-            Timber.e("Error syncing playlists: ${e.message}")
+            Timber.e("Error fetching albums: ${e.message}")
+            emptyList()
         }
     }
 
-    private suspend fun syncLibraryAlbums() {
-        _syncState.update { it.copy(progress = "Syncing albums...") }
-
-        try {
-            // Fetch library albums
-            val libraryResult = YouTube.library("FEmusic_liked_albums")
-            val library = libraryResult.getOrNull() ?: return
-
-            library.items.filterIsInstance<AlbumItem>().forEach { album ->
-                saveAlbumToDatabase(album, bookmarked = true)
-            }
-
+    private suspend fun fetchLibraryArtists(): List<ArtistItem> {
+        return try {
+            val result = YouTube.library("FEmusic_library_corpus_track_artists")
+            result.getOrNull()?.items?.filterIsInstance<ArtistItem>() ?: emptyList()
         } catch (e: Exception) {
-            Timber.e("Error syncing albums: ${e.message}")
+            Timber.e("Error fetching artists: ${e.message}")
+            emptyList()
         }
     }
 
-    private suspend fun syncLibraryArtists() {
-        _syncState.update { it.copy(progress = "Syncing artists...") }
+    // ============ DB Writes (called inside transaction) ============
 
-        try {
-            // Fetch library artists (subscriptions)
-            val libraryResult = YouTube.library("FEmusic_library_corpus_track_artists")
-            val library = libraryResult.getOrNull() ?: return
-
-            library.items.filterIsInstance<ArtistItem>().forEach { artist ->
-                saveArtistToDatabase(artist, subscribed = true)
-            }
-
-        } catch (e: Exception) {
-            Timber.e("Error syncing artists: ${e.message}")
-        }
-    }
-
-    private fun saveSongToDatabase(song: SongItem, liked: Boolean = false, inLibrary: Boolean = true) {
-        val artists = song.artists
-
-        // Insert song
+    private fun saveSongToDatabase(song: SongItem, liked: Boolean = false, now: String) {
         DatabaseHelper.insertSong(
             id = song.id,
             title = song.title,
@@ -185,12 +181,11 @@ object LibrarySync {
             albumName = song.album?.name,
             explicit = song.explicit,
             liked = liked,
-            likedDate = if (liked) LocalDateTime.now().toString() else null,
-            inLibrary = if (inLibrary) LocalDateTime.now().toString() else null
+            likedDate = if (liked) now else null,
+            inLibrary = now
         )
 
-        // Insert artists and mappings
-        artists.forEachIndexed { index, artist ->
+        song.artists.forEachIndexed { index, artist ->
             val artistId = artist.id ?: "unknown_${artist.name.hashCode()}"
             DatabaseHelper.insertArtist(
                 id = artistId,
@@ -204,7 +199,7 @@ object LibrarySync {
         }
     }
 
-    private fun saveAlbumToDatabase(album: AlbumItem, bookmarked: Boolean = false) {
+    private fun saveAlbumToDatabase(album: AlbumItem, bookmarked: Boolean = false, now: String) {
         DatabaseHelper.insertAlbum(
             id = album.id,
             title = album.title,
@@ -212,23 +207,22 @@ object LibrarySync {
             year = album.year,
             thumbnailUrl = album.thumbnail,
             explicit = album.explicit,
-            bookmarkedAt = if (bookmarked) LocalDateTime.now().toString() else null,
-            inLibrary = LocalDateTime.now().toString()
+            bookmarkedAt = if (bookmarked) now else null,
+            inLibrary = now
         )
     }
 
-    private fun saveArtistToDatabase(artist: ArtistItem, subscribed: Boolean = false) {
+    private fun saveArtistToDatabase(artist: ArtistItem, subscribed: Boolean = false, now: String) {
         DatabaseHelper.insertArtist(
             id = artist.id,
             name = artist.title,
             thumbnailUrl = artist.thumbnail,
             channelId = artist.channelId,
-            bookmarkedAt = if (subscribed) LocalDateTime.now().toString() else null
+            bookmarkedAt = if (subscribed) now else null
         )
     }
 
-    private fun savePlaylistToDatabase(playlist: PlaylistItem) {
-        // Parse songCountText like "50 songs" to get the number
+    private fun savePlaylistToDatabase(playlist: PlaylistItem, now: String) {
         val songCount = playlist.songCountText?.filter { it.isDigit() }?.toIntOrNull()
 
         DatabaseHelper.insertPlaylist(
@@ -236,7 +230,7 @@ object LibrarySync {
             name = playlist.title,
             browseId = playlist.id,
             isEditable = playlist.isEditable,
-            bookmarkedAt = LocalDateTime.now().toString(),
+            bookmarkedAt = now,
             remoteSongCount = songCount,
             thumbnailUrl = playlist.thumbnail
         )

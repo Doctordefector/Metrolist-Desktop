@@ -21,6 +21,8 @@ import com.metrolist.music.desktop.playback.DesktopPlayer
 import com.metrolist.music.desktop.integration.DiscordRPC
 import com.metrolist.music.desktop.integration.LastFmManager
 import com.metrolist.music.desktop.notification.DesktopNotification
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import org.jetbrains.skia.Image
 import timber.log.Timber
 
@@ -40,24 +42,26 @@ fun main() {
         null
     }
 
-    application {
-        // Initialize services
-        DatabaseHelper.initialize()
-        PreferencesManager.initialize()
-        AuthManager.initialize()
+    // Initialize core services before window (fast, no I/O)
+    DatabaseHelper.initialize()
+    PreferencesManager.initialize()
 
+    application {
         val windowState = rememberWindowState(width = 1200.dp, height = 800.dp)
         val player = remember { DesktopPlayer() }
 
-        // Initialize media key handler after player is created
+        // Initialize VLC, auth, media keys, queue restore, and integrations off the main thread
         LaunchedEffect(player) {
+            withContext(Dispatchers.IO) {
+                player.ensureVlcInitialized()
+            }
             MediaKeyHandler.initialize(player)
-        }
-
-        // Restore queue, apply saved volume, and initialize integrations
-        LaunchedEffect(Unit) {
+            // Auth needs network — run after window is visible
+            AuthManager.initialize()
+            // Restore queue (metadata only, no stream URL resolution)
             player.restoreQueue()
             player.setVolume(PreferencesManager.preferences.value.volume)
+            // Integrations
             DiscordRPC.initialize(player)
             LastFmManager.initialize(player)
             DesktopNotification.initialize(player)

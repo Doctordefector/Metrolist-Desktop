@@ -198,13 +198,17 @@ object DownloadManager {
             connection.requestMethod = "GET"
             connection.connectTimeout = 30000
             connection.readTimeout = 30000
+            // Some YouTube CDN endpoints need a user-agent
+            connection.setRequestProperty("User-Agent", "Mozilla/5.0")
 
             val totalSize = connection.contentLengthLong
             var downloadedSize = 0L
+            var lastProgressUpdate = 0
 
-            connection.inputStream.use { input ->
-                FileOutputStream(tempFile).use { output ->
-                    val buffer = ByteArray(8192)
+            connection.inputStream.buffered(262144).use { input ->
+                FileOutputStream(tempFile).use { fos ->
+                    val output = fos.buffered(262144) // 256KB write buffer
+                    val buffer = ByteArray(65536) // 64KB read chunks
                     var bytesRead: Int
 
                     while (input.read(buffer).also { bytesRead = it } != -1) {
@@ -217,20 +221,27 @@ object DownloadManager {
                             -1
                         }
 
-                        // Update progress
-                        _activeDownloads.update { downloads ->
-                            downloads + (song.id to DownloadProgress(
-                                songId = song.id,
-                                songTitle = song.title,
-                                progress = progress,
-                                status = DownloadStatus.DOWNLOADING
-                            ))
+                        // Only update UI/DB when progress changes by at least 1%
+                        if (progress != lastProgressUpdate) {
+                            lastProgressUpdate = progress
+                            _activeDownloads.update { downloads ->
+                                downloads + (song.id to DownloadProgress(
+                                    songId = song.id,
+                                    songTitle = song.title,
+                                    progress = progress,
+                                    status = DownloadStatus.DOWNLOADING
+                                ))
+                            }
+                            // Only write to DB every 5%
+                            if (progress % 5 == 0) {
+                                DatabaseHelper.updateDownloadProgress(song.id, progress, "downloading")
+                            }
                         }
-                        DatabaseHelper.updateDownloadProgress(song.id, progress, "downloading")
 
-                        // Check for cancellation
+                        // Check for cancellation periodically
                         yield()
                     }
+                    output.flush()
                 }
             }
 

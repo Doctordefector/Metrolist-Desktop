@@ -48,27 +48,7 @@ object AuthManager {
     private val _authState = MutableStateFlow(AuthState())
     val authState: StateFlow<AuthState> = _authState.asStateFlow()
 
-    private val credentialsFile: File by lazy {
-        val appDir = getAppDataDir()
-        appDir.mkdirs()
-        File(appDir, "credentials.json")
-    }
-
-    private fun getAppDataDir(): File {
-        val os = System.getProperty("os.name").lowercase()
-        return when {
-            os.contains("win") -> {
-                val appData = System.getenv("APPDATA") ?: System.getProperty("user.home")
-                File(appData, "Metrolist")
-            }
-            os.contains("mac") -> {
-                File(System.getProperty("user.home"), "Library/Application Support/Metrolist")
-            }
-            else -> {
-                File(System.getProperty("user.home"), ".config/metrolist")
-            }
-        }
-    }
+    private val credentialsFile: File get() = com.metrolist.music.desktop.AppPaths.credentialsFile
 
     fun initialize() {
         loadCredentials()

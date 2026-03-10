@@ -13,6 +13,7 @@ import uk.co.caprica.vlcj.factory.discovery.NativeDiscovery
 import uk.co.caprica.vlcj.player.base.MediaPlayer
 import uk.co.caprica.vlcj.player.base.MediaPlayerEventAdapter
 import uk.co.caprica.vlcj.player.component.AudioPlayerComponent
+import uk.co.caprica.vlcj.player.base.Equalizer
 import java.io.File
 
 enum class RepeatMode {
@@ -56,8 +57,23 @@ class DesktopPlayer {
     private var shuffleEnabled = false
     private var repeatMode = RepeatMode.OFF
 
-    init {
-        initializeVlc()
+    // Equalizer (vlcj programmatic API — real-time, no restart needed)
+    private var vlcEqualizer: Equalizer? = null
+
+    // Play event tracking
+    private var trackStartTime: Long = 0L       // System.currentTimeMillis when track started playing
+    private var accumulatedPlayTime: Long = 0L   // ms accumulated while playing (pauses excluded)
+    private var lastPlayStateTime: Long = 0L     // timestamp of last play/pause state change
+    private var wasPlaying: Boolean = false
+
+    private var vlcInitialized = false
+
+    /** Call from a coroutine to initialize VLC off the main thread */
+    fun ensureVlcInitialized() {
+        if (!vlcInitialized) {
+            vlcInitialized = true
+            initializeVlc()
+        }
     }
 
     private fun initializeVlc() {
@@ -123,19 +139,23 @@ class DesktopPlayer {
             override fun playing(mediaPlayer: MediaPlayer) {
                 _state.value = _state.value.copy(isPlaying = true)
                 startPositionUpdates()
+                onPlayStateChanged(true)
             }
 
             override fun paused(mediaPlayer: MediaPlayer) {
                 _state.value = _state.value.copy(isPlaying = false)
                 stopPositionUpdates()
+                onPlayStateChanged(false)
             }
 
             override fun stopped(mediaPlayer: MediaPlayer) {
                 _state.value = _state.value.copy(isPlaying = false, position = 0L)
                 stopPositionUpdates()
+                onPlayStateChanged(false)
             }
 
             override fun finished(mediaPlayer: MediaPlayer) {
+                onPlayStateChanged(false)
                 scope.launch {
                     onTrackFinished()
                 }
@@ -252,6 +272,11 @@ class DesktopPlayer {
     }
 
     private fun playUrl(url: String, song: SongInfo) {
+        // Record play event for the previous track before switching
+        if (_state.value.currentSong != null) {
+            recordPlayEvent()
+        }
+
         val options = buildMediaOptions()
         if (options.isNotEmpty()) {
             audioPlayer?.mediaPlayer()?.media()?.play(url, *options.toTypedArray())
@@ -263,6 +288,10 @@ class DesktopPlayer {
             position = 0L,
             currentIndex = currentIndex
         )
+        resetPlayTracking()
+
+        // Re-apply EQ after starting new media (VLC resets filters on new media)
+        applyEqualizer()
     }
 
     /**
@@ -314,8 +343,18 @@ class DesktopPlayer {
         audioPlayer?.mediaPlayer()?.let { player ->
             if (player.status().isPlaying) {
                 player.controls().pause()
-            } else {
+            } else if (player.media().info() != null) {
+                // Media is loaded, just resume
                 player.controls().play()
+            } else if (currentIndex in 0 until queue.size) {
+                // No media loaded (e.g. restored queue) — resolve stream and play
+                val song = queue[currentIndex]
+                scope.launch {
+                    val streamUrl = getStreamUrl(song.id)
+                    if (streamUrl != null) {
+                        playUrl(streamUrl, song)
+                    }
+                }
             }
         }
     }
@@ -606,24 +645,140 @@ class DesktopPlayer {
                     repeatMode = repeatMode,
                     position = queueState?.positionMs ?: 0L
                 )
-
-                // Auto-resume: load the stream but don't play (user can press play)
-                val streamUrl = getStreamUrl(song.id)
-                if (streamUrl != null) {
-                    val options = buildMediaOptions()
-                    if (options.isNotEmpty()) {
-                        audioPlayer?.mediaPlayer()?.media()?.prepare(streamUrl, *options.toTypedArray())
-                    } else {
-                        audioPlayer?.mediaPlayer()?.media()?.prepare(streamUrl)
-                    }
-                }
+                // Stream URL resolved lazily on first play — no network call at startup
             }
         } catch (e: Exception) {
             Timber.e("Failed to restore queue: ${e.message}")
         }
     }
 
+    // ============ Play Event Tracking ============
+
+    private fun onPlayStateChanged(playing: Boolean) {
+        val now = System.currentTimeMillis()
+        if (wasPlaying && !playing) {
+            // Was playing, now paused/stopped — accumulate time
+            accumulatedPlayTime += now - lastPlayStateTime
+        }
+        lastPlayStateTime = now
+        wasPlaying = playing
+    }
+
+    private fun resetPlayTracking() {
+        val now = System.currentTimeMillis()
+        trackStartTime = now
+        lastPlayStateTime = now
+        accumulatedPlayTime = 0L
+        wasPlaying = false
+    }
+
+    private fun recordPlayEvent() {
+        // Finalize accumulated time if currently playing
+        if (wasPlaying) {
+            accumulatedPlayTime += System.currentTimeMillis() - lastPlayStateTime
+        }
+        val songId = _state.value.currentSong?.id ?: return
+        val playTimeMs = accumulatedPlayTime
+        // Only record if played for at least 10 seconds
+        if (playTimeMs >= 10_000) {
+            scope.launch(Dispatchers.IO) {
+                try {
+                    DatabaseHelper.recordEvent(songId, playTimeMs)
+                    Timber.d("Recorded play event: $songId, ${playTimeMs / 1000}s")
+                } catch (e: Exception) {
+                    Timber.e("Failed to record play event: ${e.message}")
+                }
+            }
+        }
+        resetPlayTracking()
+    }
+
+    // ============ Equalizer ============
+
+    /** Available EQ preset names from VLC */
+    fun getEqualizerPresets(): List<String> {
+        val factory = audioPlayer?.mediaPlayerFactory() ?: return emptyList()
+        return factory.equalizer().presets()
+    }
+
+    /** EQ band center frequencies in Hz */
+    fun getEqualizerBands(): List<Float> {
+        val factory = audioPlayer?.mediaPlayerFactory() ?: return emptyList()
+        return factory.equalizer().bands()
+    }
+
+    /** Apply EQ settings from preferences (call on init and when prefs change) */
+    fun applyEqualizer() {
+        val player = audioPlayer?.mediaPlayer() ?: return
+        val prefs = PreferencesManager.preferences.value
+
+        if (!prefs.eqEnabled) {
+            player.audio().setEqualizer(null)
+            vlcEqualizer = null
+            return
+        }
+
+        val factory = audioPlayer?.mediaPlayerFactory() ?: return
+        val eq = if (prefs.eqPreset != null) {
+            factory.equalizer().newEqualizer(prefs.eqPreset)
+        } else {
+            factory.equalizer().newEqualizer()
+        }
+
+        if (eq != null) {
+            eq.setPreamp(prefs.eqPreamp)
+            if (prefs.eqPreset == null) {
+                // Apply custom band values
+                prefs.eqBands.forEachIndexed { i, gain ->
+                    eq.setAmp(i, gain)
+                }
+            }
+            player.audio().setEqualizer(eq)
+            vlcEqualizer = eq
+        }
+    }
+
+    /** Update a single EQ band in real-time */
+    fun setEqualizerBand(index: Int, gain: Float) {
+        vlcEqualizer?.setAmp(index, gain)
+        PreferencesManager.setEqBand(index, gain)
+    }
+
+    /** Update preamp in real-time */
+    fun setEqualizerPreamp(preamp: Float) {
+        vlcEqualizer?.setPreamp(preamp)
+        PreferencesManager.setEqPreamp(preamp)
+    }
+
+    /** Switch to a named preset */
+    fun setEqualizerPreset(presetName: String) {
+        val factory = audioPlayer?.mediaPlayerFactory() ?: return
+        val eq = factory.equalizer().newEqualizer(presetName) ?: return
+        audioPlayer?.mediaPlayer()?.audio()?.setEqualizer(eq)
+        vlcEqualizer = eq
+
+        // Save preset and its band values to prefs
+        val bands = (0 until 10).map { eq.amp(it) }
+        PreferencesManager.setEqPreset(presetName)
+        PreferencesManager.setEqPreamp(eq.preamp())
+        val current = PreferencesManager.preferences.value
+        // Update bands without clearing preset (setEqBands clears preset, so update directly)
+        val updatedPrefs = current.copy(eqBands = bands, eqPreset = presetName)
+        // We need to save all at once — use internal update
+        PreferencesManager.setEqPreset(presetName)
+    }
+
+    /** Enable/disable EQ */
+    fun setEqualizerEnabled(enabled: Boolean) {
+        PreferencesManager.setEqEnabled(enabled)
+        applyEqualizer()
+    }
+
     fun release() {
+        // Record final play event before shutdown
+        if (_state.value.currentSong != null) {
+            recordPlayEvent()
+        }
         // Save queue synchronously before canceling the scope
         if (PreferencesManager.preferences.value.persistQueue) {
             try {

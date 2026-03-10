@@ -26,7 +26,7 @@ import java.util.zip.ZipInputStream
  * Program Files, it's installed. Otherwise it's portable.
  */
 object AutoUpdater {
-    const val CURRENT_VERSION = "2.2.2"
+    const val CURRENT_VERSION = "2.3.2"
     private const val GITHUB_OWNER = "Doctordefector"
     private const val GITHUB_REPO = "Metrolist-Desktop"
     private const val API_URL = "https://api.github.com/repos/$GITHUB_OWNER/$GITHUB_REPO/releases/latest"
@@ -154,9 +154,12 @@ object AutoUpdater {
                 Timber.i("Download complete: ${downloadFile.length()} bytes")
 
                 if (current.isPortable) {
-                    // Extract ZIP to staging
-                    val stagingDir = File(updateDir, "staging")
-                    if (stagingDir.exists()) stagingDir.deleteRecursively()
+                    // Extract ZIP to a fresh temp staging dir to avoid leftover locked files
+                    val stagingDir = File(updateDir, "staging-${System.currentTimeMillis()}")
+                    // Clean up any old staging dirs
+                    updateDir.listFiles()?.filter { it.name.startsWith("staging") }?.forEach { old ->
+                        try { old.deleteRecursively() } catch (_: Exception) {}
+                    }
                     Files.createDirectories(stagingDir.toPath())
 
                     Timber.i("Extracting to ${stagingDir.absolutePath}")
@@ -249,7 +252,7 @@ object AutoUpdater {
             destPath = appDir.absolutePath,
             exePath = File(appDir, "Metrolist.exe").absolutePath,
             logPath = logFile,
-            stagingRoot = File(updateDir, "staging").absolutePath
+            stagingRoot = sourceDir.parentFile.absolutePath
         ))
 
         ProcessBuilder(
@@ -413,7 +416,9 @@ object AutoUpdater {
         ZipInputStream(zipFile.inputStream().buffered()).use { zis ->
             var entry = zis.nextEntry
             while (entry != null) {
-                val name = entry.name
+                // Normalize backslashes — PowerShell Compress-Archive uses \ in entry names,
+                // but Java's ZipEntry.isDirectory() only checks for trailing /
+                val name = entry.name.replace('\\', '/')
                 val outFile = File(targetDir, name)
 
                 // Zip slip protection
@@ -421,12 +426,19 @@ object AutoUpdater {
                     throw SecurityException("Zip slip: $name")
                 }
 
-                if (entry.isDirectory) {
-                    Files.createDirectories(outFile.toPath())
-                } else {
-                    outFile.parentFile?.let { Files.createDirectories(it.toPath()) }
-                    FileOutputStream(outFile).use { fos -> zis.copyTo(fos, bufferSize = 65536) }
-                    count++
+                try {
+                    if (entry.isDirectory || name.endsWith("/")) {
+                        Files.createDirectories(outFile.toPath())
+                    } else {
+                        // Always ensure parent dirs exist (ZIP may lack intermediate dir entries)
+                        outFile.parentFile?.let { Files.createDirectories(it.toPath()) }
+                        if (outFile.exists()) outFile.delete()
+                        FileOutputStream(outFile).use { fos -> zis.copyTo(fos, bufferSize = 65536) }
+                        count++
+                    }
+                } catch (e: Exception) {
+                    Timber.e("Failed to extract: $name → ${e.message}")
+                    throw Exception("Cannot extract '$name': ${e.message}", e)
                 }
                 zis.closeEntry()
                 entry = zis.nextEntry

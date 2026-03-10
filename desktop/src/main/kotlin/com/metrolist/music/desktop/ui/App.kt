@@ -44,6 +44,8 @@ sealed class DetailScreen {
     data class Podcast(val podcastId: String) : DetailScreen()
     data object ListenTogether : DetailScreen()
     data object Recognition : DetailScreen()
+    data object Equalizer : DetailScreen()
+    data object Stats : DetailScreen()
 }
 
 @Composable
@@ -52,6 +54,7 @@ fun App(player: DesktopPlayer) {
     var currentScreen by remember { mutableStateOf(Screen.Home) }
     var showQueueScreen by remember { mutableStateOf(false) }
     var showLyricsPanel by remember { mutableStateOf(false) }
+    var showCommandPalette by remember { mutableStateOf(false) }
     val authState by AuthManager.authState.collectAsState()
     val scope = rememberCoroutineScope()
 
@@ -114,34 +117,32 @@ fun App(player: DesktopPlayer) {
                     }
                     // Skip all other shortcuts when a text field is focused
                     if (MediaKeyHandler.textInputActive) return@onPreviewKeyEvent false
+
+                    // Navigation shortcuts (handled here because they need UI state)
                     when {
-                        // Ctrl+Right = next track
-                        (event.key == Key.DirectionRight && event.isCtrlPressed) -> {
-                            scope.launch { player.playNext() }
-                            true
-                        }
-                        // Ctrl+Left = previous track
-                        (event.key == Key.DirectionLeft && event.isCtrlPressed) -> {
-                            scope.launch { player.playPrevious() }
-                            true
-                        }
-                        // Ctrl+F = focus search
                         event.key == Key.F && event.isCtrlPressed -> {
                             currentScreen = Screen.Search
                             detailStack.clear()
                             true
                         }
-                        // Ctrl+Q = toggle queue
                         event.key == Key.Q && event.isCtrlPressed -> {
                             showQueueScreen = !showQueueScreen
                             true
                         }
-                        // Ctrl+L = toggle lyrics
                         event.key == Key.L && event.isCtrlPressed -> {
                             showLyricsPanel = !showLyricsPanel
                             true
                         }
-                        else -> false
+                        event.key == Key.K && event.isCtrlPressed -> {
+                            showCommandPalette = !showCommandPalette
+                            true
+                        }
+                        // All player shortcuts (Space, M, arrows, Ctrl+combos) go through MediaKeyHandler
+                        else -> MediaKeyHandler.handleComposeKeyEvent(
+                            event.key,
+                            event.isCtrlPressed,
+                            player
+                        )
                     }
                 } else false
             }) {
@@ -187,6 +188,28 @@ fun App(player: DesktopPlayer) {
                     }
 
                     Spacer(Modifier.weight(1f))
+
+                    // Equalizer
+                    NavigationRailItem(
+                        icon = { Icon(Icons.Default.Equalizer, "Equalizer") },
+                        label = { Text("EQ") },
+                        selected = detailStack.lastOrNull() is DetailScreen.Equalizer,
+                        onClick = {
+                            detailStack.clear()
+                            detailStack.add(DetailScreen.Equalizer)
+                        }
+                    )
+
+                    // Stats
+                    NavigationRailItem(
+                        icon = { Icon(Icons.Default.BarChart, "Stats") },
+                        label = { Text("Stats") },
+                        selected = detailStack.lastOrNull() is DetailScreen.Stats,
+                        onClick = {
+                            detailStack.clear()
+                            detailStack.add(DetailScreen.Stats)
+                        }
+                    )
 
                     // Music Recognition button
                     NavigationRailItem(
@@ -267,6 +290,15 @@ fun App(player: DesktopPlayer) {
                                         player = player,
                                         onBack = ::navigateBack
                                     )
+                                    is DetailScreen.Equalizer -> EqualizerScreen(
+                                        player = player,
+                                        onBack = ::navigateBack
+                                    )
+                                    is DetailScreen.Stats -> StatsScreen(
+                                        onBack = ::navigateBack,
+                                        onArtistClick = ::navigateToArtist,
+                                        onAlbumClick = ::navigateToAlbum
+                                    )
                                 }
                             } else {
                                 when (currentScreen) {
@@ -313,6 +345,29 @@ fun App(player: DesktopPlayer) {
                         lyricsActive = showLyricsPanel
                     )
                 }
+
+                // Command palette overlay
+                CommandPalette(
+                    visible = showCommandPalette,
+                    player = player,
+                    onDismiss = { showCommandPalette = false },
+                    onNavigate = { action: PaletteAction ->
+                        when (action) {
+                            is PaletteAction.GoHome -> { currentScreen = Screen.Home; detailStack.clear() }
+                            is PaletteAction.GoSearch -> { currentScreen = Screen.Search; detailStack.clear() }
+                            is PaletteAction.GoLibrary -> { currentScreen = Screen.Library; detailStack.clear() }
+                            is PaletteAction.GoSettings -> { currentScreen = Screen.Settings; detailStack.clear() }
+                            is PaletteAction.GoEqualizer -> { detailStack.clear(); detailStack.add(DetailScreen.Equalizer) }
+                            is PaletteAction.GoStats -> { detailStack.clear(); detailStack.add(DetailScreen.Stats) }
+                            is PaletteAction.GoQueue -> { showQueueScreen = true }
+                            is PaletteAction.GoLyrics -> { showLyricsPanel = !showLyricsPanel }
+                            is PaletteAction.NextTrack -> scope.launch { player.playNext() }
+                            is PaletteAction.PrevTrack -> scope.launch { player.playPrevious() }
+                            is PaletteAction.PlaySong -> scope.launch { player.playSong(action.song) }
+                            else -> {} // PlayPause, Shuffle, Repeat handled in executeAction
+                        }
+                    }
+                )
             }
         }
     }

@@ -58,6 +58,20 @@ object DatabaseHelper {
             """.trimIndent(), 0)
         }
 
+        if ("Event" !in existingTables) {
+            driver.execute(null, """
+                CREATE TABLE IF NOT EXISTS Event (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    songId TEXT NOT NULL,
+                    timestamp INTEGER NOT NULL,
+                    playTime INTEGER NOT NULL DEFAULT 0,
+                    FOREIGN KEY (songId) REFERENCES Song(id) ON DELETE CASCADE
+                )
+            """.trimIndent(), 0)
+            driver.execute(null, "CREATE INDEX IF NOT EXISTS event_song_idx ON Event(songId)", 0)
+            driver.execute(null, "CREATE INDEX IF NOT EXISTS event_timestamp_idx ON Event(timestamp)", 0)
+        }
+
         if ("PlayQueueState" !in existingTables) {
             driver.execute(null, """
                 CREATE TABLE IF NOT EXISTS PlayQueueState (
@@ -71,21 +85,19 @@ object DatabaseHelper {
         }
     }
 
-    private fun getDatabaseFile(): File {
-        val os = System.getProperty("os.name").lowercase()
-        val baseDir = when {
-            os.contains("win") -> {
-                val appData = System.getenv("APPDATA") ?: System.getProperty("user.home")
-                File(appData, "Metrolist")
-            }
-            os.contains("mac") -> {
-                File(System.getProperty("user.home"), "Library/Application Support/Metrolist")
-            }
-            else -> {
-                File(System.getProperty("user.home"), ".config/metrolist")
-            }
+    private fun getDatabaseFile(): File = com.metrolist.music.desktop.AppPaths.databaseFile
+
+    // ============ Transaction Support ============
+
+    /**
+     * Run a block of DB operations inside a single SQLite transaction.
+     * SQLDelight reactive flows are only notified ONCE when the transaction commits,
+     * avoiding per-row UI recompositions during bulk inserts.
+     */
+    fun <T> transaction(body: () -> T): T {
+        return database.transactionWithResult {
+            body()
         }
-        return File(baseDir, "metrolist.db")
     }
 
     // ============ Song Operations ============
@@ -455,5 +467,100 @@ object DatabaseHelper {
                 positionMs = it.positionMs
             )
         }
+    }
+
+    // ============ Events / Stats ============
+
+    data class PlayEvent(
+        val eventId: Long,
+        val songId: String,
+        val timestamp: Long,
+        val playTime: Long,
+        val title: String,
+        val thumbnailUrl: String?,
+        val albumName: String?,
+        val albumId: String?
+    )
+
+    data class SongStats(
+        val id: String,
+        val title: String,
+        val thumbnailUrl: String?,
+        val albumName: String?,
+        val albumId: String?,
+        val duration: Long,
+        val playCount: Long,
+        val totalTime: Long
+    )
+
+    data class ArtistStats(
+        val id: String,
+        val name: String,
+        val thumbnailUrl: String?,
+        val playCount: Long,
+        val totalTime: Long
+    )
+
+    data class AlbumStats(
+        val id: String,
+        val title: String,
+        val thumbnailUrl: String?,
+        val year: Long?,
+        val playCount: Long,
+        val totalTime: Long
+    )
+
+    fun recordEvent(songId: String, playTimeMs: Long) {
+        val now = System.currentTimeMillis()
+        queries.insertEvent(songId, now, playTimeMs)
+        queries.incrementTotalPlayTime(playTimeMs, songId)
+    }
+
+    fun getAllEvents(): List<PlayEvent> {
+        return queries.getAllEvents { eventId, songId, timestamp, playTime, title, thumbnailUrl, albumName, albumId ->
+            PlayEvent(eventId, songId, timestamp, playTime, title, thumbnailUrl, albumName, albumId)
+        }.executeAsList()
+    }
+
+    fun getEventCount(): Long {
+        return queries.getEventCount().executeAsOne()
+    }
+
+    fun getFirstEventTimestamp(): Long? {
+        return queries.getFirstEventTimestamp().executeAsOneOrNull()?.MIN
+    }
+
+    fun clearAllEvents() {
+        queries.clearAllEvents()
+    }
+
+    fun getMostPlayedSongs(fromTimestamp: Long, toTimestamp: Long): List<SongStats> {
+        return queries.mostPlayedSongs(fromTimestamp, toTimestamp) { id, title, thumbnailUrl, albumName, albumId, duration, playCount, totalTime ->
+            SongStats(id, title, thumbnailUrl, albumName, albumId, duration, playCount, totalTime ?: 0)
+        }.executeAsList()
+    }
+
+    fun getMostPlayedArtists(fromTimestamp: Long, toTimestamp: Long): List<ArtistStats> {
+        return queries.mostPlayedArtists(fromTimestamp, toTimestamp) { id, name, thumbnailUrl, playCount, totalTime ->
+            ArtistStats(id, name, thumbnailUrl, playCount, totalTime ?: 0)
+        }.executeAsList()
+    }
+
+    fun getMostPlayedAlbums(fromTimestamp: Long, toTimestamp: Long): List<AlbumStats> {
+        return queries.mostPlayedAlbums(fromTimestamp, toTimestamp) { id, title, thumbnailUrl, year, playCount, totalTime ->
+            AlbumStats(id, title, thumbnailUrl, year, playCount, totalTime ?: 0)
+        }.executeAsList()
+    }
+
+    fun getTotalPlayTimeInRange(fromTimestamp: Long, toTimestamp: Long): Long {
+        return queries.getTotalPlayTimeInRange(fromTimestamp, toTimestamp).executeAsOne()
+    }
+
+    fun getUniqueSongCountInRange(fromTimestamp: Long, toTimestamp: Long): Long {
+        return queries.getUniqueSongCountInRange(fromTimestamp, toTimestamp).executeAsOne()
+    }
+
+    fun getUniqueArtistCountInRange(fromTimestamp: Long, toTimestamp: Long): Long {
+        return queries.getUniqueArtistCountInRange(fromTimestamp, toTimestamp).executeAsOne()
     }
 }

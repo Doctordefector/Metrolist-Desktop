@@ -24,6 +24,7 @@ import coil3.compose.AsyncImage
 import com.metrolist.music.desktop.db.DatabaseHelper
 import com.metrolist.music.desktop.db.Playlist
 import com.metrolist.music.desktop.download.DownloadManager
+import com.metrolist.music.desktop.media.MediaKeyHandler
 import com.metrolist.music.desktop.playback.DesktopPlayer
 import com.metrolist.music.desktop.playback.RepeatMode
 import com.metrolist.music.desktop.settings.PreferencesManager
@@ -247,27 +248,20 @@ fun MiniPlayer(
 
                 Spacer(Modifier.width(8.dp))
 
-                // Volume slider (persisted) with mute memory
+                // Volume slider (persisted) with proper mute state
                 val prefs by PreferencesManager.preferences.collectAsState()
                 val volume = prefs.volume
-                var volumeBeforeMute by remember { mutableStateOf(1f) }
+                val isMuted = prefs.isMuted
                 IconButton(
                     onClick = {
-                        val newVol = if (volume > 0f) {
-                            volumeBeforeMute = volume
-                            0f
-                        } else {
-                            if (volumeBeforeMute > 0f) volumeBeforeMute else 1f
-                        }
-                        PreferencesManager.setVolume(newVol)
-                        player.setVolume(newVol)
+                        MediaKeyHandler.toggleMute(player)
                     },
                     modifier = Modifier.size(28.dp)
                 ) {
                     Icon(
-                        if (volume > 0.5f) Icons.AutoMirrored.Filled.VolumeUp
-                        else if (volume > 0f) Icons.AutoMirrored.Filled.VolumeDown
-                        else Icons.AutoMirrored.Filled.VolumeOff,
+                        if (isMuted || volume == 0f) Icons.AutoMirrored.Filled.VolumeOff
+                        else if (volume > 0.5f) Icons.AutoMirrored.Filled.VolumeUp
+                        else Icons.AutoMirrored.Filled.VolumeDown,
                         contentDescription = "Volume",
                         modifier = Modifier.size(20.dp)
                     )
@@ -275,6 +269,8 @@ fun MiniPlayer(
                 Slider(
                     value = volume,
                     onValueChange = {
+                        // If user drags slider, unmute
+                        if (isMuted) PreferencesManager.setMuted(false)
                         PreferencesManager.setVolume(it)
                         player.setVolume(it)
                     },

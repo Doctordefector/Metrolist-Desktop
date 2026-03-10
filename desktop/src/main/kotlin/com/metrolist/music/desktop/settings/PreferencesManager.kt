@@ -35,30 +35,21 @@ data class AppPreferences(
     val lastFmSessionKey: String? = null,
     val lastFmUsername: String? = null,
     val notificationsEnabled: Boolean = true,
-    val volume: Float = 1f
+    val volume: Float = 1f,
+    val isMuted: Boolean = false,
+    val volumeBeforeMute: Float = 1f,
+    // Equalizer
+    val eqEnabled: Boolean = false,
+    val eqPreset: String? = null, // null = custom
+    val eqPreamp: Float = 12f,
+    val eqBands: List<Float> = List(10) { 0f }, // 10-band gains in dB (-20 to +20)
 )
 
 object PreferencesManager {
     private val _preferences = MutableStateFlow(AppPreferences())
     val preferences: StateFlow<AppPreferences> = _preferences.asStateFlow()
 
-    private val prefsFile: File by lazy {
-        val os = System.getProperty("os.name").lowercase()
-        val baseDir = when {
-            os.contains("win") -> {
-                val appData = System.getenv("APPDATA") ?: System.getProperty("user.home")
-                File(appData, "Metrolist")
-            }
-            os.contains("mac") -> {
-                File(System.getProperty("user.home"), "Library/Application Support/Metrolist")
-            }
-            else -> {
-                File(System.getProperty("user.home"), ".config/metrolist")
-            }
-        }
-        baseDir.mkdirs()
-        File(baseDir, "preferences.properties")
-    }
+    private val prefsFile: File get() = com.metrolist.music.desktop.AppPaths.preferencesFile
 
     fun initialize() {
         loadPreferences()
@@ -91,7 +82,15 @@ object PreferencesManager {
                     lastFmSessionKey = props.getProperty("lastFmSessionKey"),
                     lastFmUsername = props.getProperty("lastFmUsername"),
                     notificationsEnabled = props.getProperty("notificationsEnabled")?.toBoolean() ?: true,
-                    volume = props.getProperty("volume")?.toFloatOrNull()?.coerceIn(0f, 1f) ?: 1f
+                    volume = props.getProperty("volume")?.toFloatOrNull()?.coerceIn(0f, 1f) ?: 1f,
+                    isMuted = props.getProperty("isMuted")?.toBoolean() ?: false,
+                    volumeBeforeMute = props.getProperty("volumeBeforeMute")?.toFloatOrNull()?.coerceIn(0f, 1f) ?: 1f,
+                    eqEnabled = props.getProperty("eqEnabled")?.toBoolean() ?: false,
+                    eqPreset = props.getProperty("eqPreset"),
+                    eqPreamp = props.getProperty("eqPreamp")?.toFloatOrNull()?.coerceIn(-20f, 20f) ?: 12f,
+                    eqBands = props.getProperty("eqBands")?.split(",")
+                        ?.mapNotNull { it.trim().toFloatOrNull()?.coerceIn(-20f, 20f) }
+                        ?.takeIf { it.size == 10 } ?: List(10) { 0f },
                 )
             }
         } catch (e: Exception) {
@@ -121,6 +120,12 @@ object PreferencesManager {
             prefs.lastFmUsername?.let { props.setProperty("lastFmUsername", it) }
             props.setProperty("notificationsEnabled", prefs.notificationsEnabled.toString())
             props.setProperty("volume", prefs.volume.toString())
+            props.setProperty("isMuted", prefs.isMuted.toString())
+            props.setProperty("volumeBeforeMute", prefs.volumeBeforeMute.toString())
+            props.setProperty("eqEnabled", prefs.eqEnabled.toString())
+            prefs.eqPreset?.let { props.setProperty("eqPreset", it) }
+            props.setProperty("eqPreamp", prefs.eqPreamp.toString())
+            props.setProperty("eqBands", prefs.eqBands.joinToString(","))
 
             prefsFile.outputStream().use {
                 props.store(it, "Metrolist Desktop Preferences")
@@ -205,6 +210,51 @@ object PreferencesManager {
         savePreferences()
     }
 
+    fun setMuted(muted: Boolean) {
+        _preferences.value = _preferences.value.copy(isMuted = muted)
+        savePreferences()
+    }
+
+    fun setVolumeBeforeMute(volume: Float) {
+        _preferences.value = _preferences.value.copy(volumeBeforeMute = volume.coerceIn(0f, 1f))
+        savePreferences()
+    }
+
+    fun setEqEnabled(enabled: Boolean) {
+        _preferences.value = _preferences.value.copy(eqEnabled = enabled)
+        savePreferences()
+    }
+
+    fun setEqPreset(preset: String?) {
+        _preferences.value = _preferences.value.copy(eqPreset = preset)
+        savePreferences()
+    }
+
+    fun setEqPreamp(preamp: Float) {
+        _preferences.value = _preferences.value.copy(eqPreamp = preamp.coerceIn(-20f, 20f))
+        savePreferences()
+    }
+
+    fun setEqBands(bands: List<Float>) {
+        _preferences.value = _preferences.value.copy(
+            eqBands = bands.map { it.coerceIn(-20f, 20f) },
+            eqPreset = null // custom when bands changed manually
+        )
+        savePreferences()
+    }
+
+    fun setEqBand(index: Int, gain: Float) {
+        val bands = _preferences.value.eqBands.toMutableList()
+        if (index in bands.indices) {
+            bands[index] = gain.coerceIn(-20f, 20f)
+            _preferences.value = _preferences.value.copy(
+                eqBands = bands,
+                eqPreset = null
+            )
+            savePreferences()
+        }
+    }
+
     fun getDownloadDirectory(): File {
         val customPath = _preferences.value.downloadPath
         if (customPath != null) {
@@ -221,46 +271,10 @@ object PreferencesManager {
         return baseDir
     }
 
-    /**
-     * Returns the application's base directory.
-     * For installed/portable apps this is where the executable lives.
-     */
-    private fun getAppDirectory(): File {
-        // Try to get the directory where the app jar/exe is located
-        try {
-            val codeSource = PreferencesManager::class.java.protectionDomain?.codeSource
-            if (codeSource != null) {
-                val jarFile = File(codeSource.location.toURI().path)
-                // For Compose Desktop distributable: Metrolist/app/Metrolist.jar -> go up to Metrolist/
-                val appDir = if (jarFile.isFile) {
-                    // Running from jar - go up from app/ to the root app folder
-                    jarFile.parentFile?.parentFile ?: jarFile.parentFile ?: File(".")
-                } else {
-                    jarFile
-                }
-                if (appDir.exists() && appDir.canWrite()) return appDir
-            }
-        } catch (_: Exception) {
-            // Fall through to user.dir
-        }
-        // Fallback: current working directory
-        return File(System.getProperty("user.dir", "."))
-    }
+    private fun getAppDirectory(): File = com.metrolist.music.desktop.AppPaths.dataDir.parentFile
 
     fun getCacheDirectory(): File {
-        val os = System.getProperty("os.name").lowercase()
-        val cacheDir = when {
-            os.contains("win") -> {
-                val localAppData = System.getenv("LOCALAPPDATA") ?: System.getenv("APPDATA") ?: System.getProperty("user.home")
-                File(localAppData, "Metrolist/Cache")
-            }
-            os.contains("mac") -> {
-                File(System.getProperty("user.home"), "Library/Caches/Metrolist")
-            }
-            else -> {
-                File(System.getProperty("user.home"), ".cache/metrolist")
-            }
-        }
+        val cacheDir = com.metrolist.music.desktop.AppPaths.cacheDir
         cacheDir.mkdirs()
         return cacheDir
     }

@@ -277,14 +277,14 @@ private fun SongsTab(
         }
     }
 
-    // Sort
+    // Sort — DATE_ADDED defaults newest-first (descending), others default ascending
     val displaySongs = remember(filteredSongs, sortMode, sortAscending) {
         val sorted = when (sortMode) {
-            SortMode.DATE_ADDED -> filteredSongs.sortedBy { it.inLibrary ?: it.likedDate ?: "" }
+            SortMode.DATE_ADDED -> filteredSongs.sortedByDescending { it.inLibrary ?: it.likedDate ?: "" }
             SortMode.NAME -> filteredSongs.sortedBy { it.title.lowercase() }
-            SortMode.PLAY_TIME -> filteredSongs.sortedBy { it.totalPlayTime }
+            SortMode.PLAY_TIME -> filteredSongs.sortedByDescending { it.totalPlayTime }
         }
-        if (sortAscending) sorted else sorted.reversed()
+        if (sortAscending) sorted.reversed() else sorted
     }
 
     Column {

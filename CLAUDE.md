@@ -164,7 +164,8 @@ Porting Metrolist (Android YouTube Music client) to desktop using Compose Deskto
 - **Timber shim**: SLF4J-backed drop-in for Android's Timber
 - **Protobuf**: Plugin `com.google.protobuf` v0.9.4, proto files at `desktop/src/main/proto/`, needs `DuplicatesStrategy.EXCLUDE` on processResources
 - **Dependencies**: vlcj 4.8.3, Coil 3.3.0, Ktor 3.4.1, SQLDelight 2.0.2, OkHttp 4.12.0, Protobuf-java 3.25.5, brotli, NewPipeExtractor, org.json, SLF4J simple
-- **Distribution**: MSI + EXE targets, optional icon patching via Resource Hacker
+- **Distribution**: Portable ZIP only (no EXE/MSI installers)
+- **CRITICAL: ZIP creation**: NEVER use PowerShell `Compress-Archive` — it uses backslashes in entry names which breaks Java's `ZipEntry.isDirectory()`. Use `7z a -tzip` instead
 
 ## Authentication System
 
@@ -227,7 +228,7 @@ Text field suppression uses `Modifier.suppressMediaKeys()` on all OutlinedTextFi
 - SQLDelight accessor is `metrolistQueries` (not `metrolistDatabaseQueries`)
 
 ## Version Management
-- **Current version**: v2.2.1
+- **Current version**: v2.3.0
 - **Version must be updated in TWO places** when releasing:
   1. `desktop/build.gradle.kts` → `packageVersion = "X.Y.Z"`
   2. `desktop/.../update/AutoUpdater.kt` → `CURRENT_VERSION = "X.Y.Z"`
@@ -240,9 +241,10 @@ Text field suppression uses `Modifier.suppressMediaKeys()` on all OutlinedTextFi
    ./gradlew :desktop:createDistributable
    ```
    Output: `desktop/build/compose/binaries/main/app/Metrolist/` (folder with exe + runtime + resources)
-3. **Create portable ZIP** (PowerShell):
+3. **Create portable ZIP** (7z — NEVER use Compress-Archive, it creates backslash entries that break Java):
    ```powershell
-   Compress-Archive -Path 'desktop/build/compose/binaries/main/app/Metrolist/*' -DestinationPath 'desktop/build/compose/binaries/main/Metrolist-X.Y.Z-portable.zip'
+   cd desktop/build/compose/binaries/main/app
+   7z a -tzip "../Metrolist-X.Y.Z-portable.zip" "Metrolist/*"
    ```
 4. **Push code** to GitHub (robocopy to temp dir, git init, commit, force push)
 5. **Create GitHub release** with portable ZIP only:
@@ -258,13 +260,15 @@ Text field suppression uses `Modifier.suppressMediaKeys()` on all OutlinedTextFi
 - Do NOT build `packageExe` or `packageMsi` — only `createDistributable`
 
 ## File Storage Paths
+All data is fully portable — stored next to the executable via centralized `AppPaths.kt`:
+- **Preferences**: `<app-dir>/data/preferences.properties`
+- **Database**: `<app-dir>/data/metrolist.db` (SQLDelight)
+- **Credentials**: `<app-dir>/data/credentials.json` (plaintext, intentional)
+- **Cache**: `<app-dir>/data/cache/`
 - **Downloads**: `<app-dir>/Downloads/` (configurable via Settings folder picker)
 - **Updates staging**: `<app-dir>/updates/` (with fallbacks to user.dir then temp)
-- **Preferences**: `%APPDATA%/Metrolist/preferences.properties` (this one stays in AppData — it's config, not data)
-- **Database**: `%APPDATA%/Metrolist/metrolist.db` (SQLDelight)
-- **Credentials**: `%APPDATA%/Metrolist/credentials.json` (plaintext, intentional)
-- **Cache**: `%LOCALAPPDATA%/Metrolist/Cache/`
-- **CRITICAL**: Downloads and update staging must NEVER go to %APPDATA%/Roaming. They default to the app directory.
+- **Migration**: On first run, `AppPaths` auto-migrates files from old `%APPDATA%/Metrolist` to `data/` if the data dir is empty
+- **CRITICAL**: NOTHING goes to %APPDATA% or %LOCALAPPDATA% anymore. Everything lives next to the app for full portability.
 
 ## GitHub & Release
 - **Private repo**: https://github.com/Doctordefector/Metrolist-Desktop
@@ -273,6 +277,45 @@ Text field suppression uses `Modifier.suppressMediaKeys()` on all OutlinedTextFi
 - `gh` CLI at `C:\Program Files\GitHub CLI\gh.exe` (not in bash PATH, use full path), authenticated as Doctordefector
 - Robocopy for push: Must use PowerShell `robocopy` (bash `robocopy` has path issues with /E flag)
 - Upload ONLY the portable ZIP to each GitHub release
+
+## Auto-Updater System
+
+### How it works (end to end)
+1. **Check**: `AutoUpdater.checkForUpdate()` hits GitHub API (`/repos/.../releases/latest`), compares `CURRENT_VERSION` against the latest tag using semver
+2. **Detect portable**: Looks for `Metrolist-*-portable.zip` in release assets — if found, uses portable update path
+3. **Download**: Streams the ZIP to `<app-dir>/updates/` with progress callbacks, shown in Settings UI
+4. **Extract**: `extractZip()` extracts to a timestamped staging dir (`updates/staging-<timestamp>/`), cleans up old staging dirs first
+5. **Verify**: Checks extracted contents for `Metrolist.exe` — rejects invalid packages
+6. **Install**: User clicks "Install & Restart" → launches a PowerShell script that:
+   - Waits for the current process to exit (polls by PID)
+   - Uses `robocopy /E /IS /IT` to copy staging → app directory (overwrites everything)
+   - Relaunches `Metrolist.exe`
+   - Cleans up staging dir and ZIP
+7. **App restarts** on the new version
+
+### Key file
+- `desktop/.../update/AutoUpdater.kt` — entire update lifecycle (check, download, extract, install script generation)
+
+### Critical gotchas
+- **ZIP must use forward slashes**: Java's `ZipEntry.isDirectory()` only checks for trailing `/`. PowerShell's `Compress-Archive` uses `\` which breaks extraction. ALWAYS use 7z to create release ZIPs.
+- **Backslash normalization**: The extractor normalizes `\` → `/` as a safety net, but don't rely on it — use 7z
+- **Timestamped staging**: Staging dirs use `staging-<millis>` to avoid conflicts from previous failed extractions where `deleteRecursively()` silently failed on locked files
+- **`getUpdateDirectory()`**: Returns `<app-dir>/updates/`. Resolves app dir from JAR `codeSource.location`, falls back to `user.dir`, then system temp. NEVER `%APPDATA%/Roaming`
+- **`findAppDirectory()`**: Walks up from JAR location to find the Metrolist root. For Compose Desktop distributable: `Metrolist/app/Metrolist.jar` → walks up 2 levels → `Metrolist/`
+- **Chicken-and-egg**: If the updater itself has a bug, users must manually download the fixed version. The running binary's updater code is what executes, not the new version's
+
+### PowerShell update script (`metrolist-update.ps1`)
+Generated dynamically by `buildPortableUpdateScript()`. Key steps:
+```powershell
+# Wait for app to exit
+while (Get-Process -Id $PID -ErrorAction SilentlyContinue) { Start-Sleep -Seconds 1 }
+# Copy new files over old
+robocopy "$sourcePath" "$destPath" /E /IS /IT
+# Restart
+Start-Process "$exePath"
+# Cleanup
+Remove-Item "$stagingRoot" -Recurse -Force
+```
 
 ## Priority Work Items
 1. **Context menus** — Play Next, Add to Queue, Add to Playlist on MiniPlayer / search results

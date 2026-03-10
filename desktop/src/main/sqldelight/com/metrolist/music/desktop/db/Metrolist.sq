@@ -130,6 +130,18 @@ CREATE TABLE PlayQueueState (
     positionMs INTEGER NOT NULL DEFAULT 0
 );
 
+-- Event table (play history for stats)
+CREATE TABLE Event (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    songId TEXT NOT NULL,
+    timestamp INTEGER NOT NULL,
+    playTime INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY (songId) REFERENCES Song(id) ON DELETE CASCADE
+);
+
+CREATE INDEX event_song_idx ON Event(songId);
+CREATE INDEX event_timestamp_idx ON Event(timestamp);
+
 -- ============ QUERIES ============
 
 -- Song queries
@@ -359,3 +371,78 @@ SELECT * FROM PlayQueueState WHERE id = 0;
 savePlayQueueState:
 INSERT OR REPLACE INTO PlayQueueState(id, currentIndex, shuffleEnabled, repeatMode, positionMs)
 VALUES (0, ?, ?, ?, ?);
+
+-- ============ EVENT / STATS QUERIES ============
+
+insertEvent:
+INSERT INTO Event(songId, timestamp, playTime)
+VALUES (?, ?, ?);
+
+incrementTotalPlayTime:
+UPDATE Song SET totalPlayTime = totalPlayTime + ? WHERE id = ?;
+
+-- All events (for history screen), newest first
+getAllEvents:
+SELECT Event.id AS eventId, Event.songId, Event.timestamp, Event.playTime,
+       Song.title, Song.thumbnailUrl, Song.albumName, Song.albumId
+FROM Event
+INNER JOIN Song ON Song.id = Event.songId
+ORDER BY Event.id DESC
+LIMIT 500;
+
+getEventCount:
+SELECT COUNT(*) FROM Event;
+
+getFirstEventTimestamp:
+SELECT MIN(timestamp) FROM Event;
+
+clearAllEvents:
+DELETE FROM Event;
+
+-- Most played songs in time range
+mostPlayedSongs:
+SELECT Song.id, Song.title, Song.thumbnailUrl, Song.albumName, Song.albumId, Song.duration,
+       COUNT(Event.id) AS playCount, SUM(Event.playTime) AS totalTime
+FROM Event
+INNER JOIN Song ON Song.id = Event.songId
+WHERE Event.timestamp >= ? AND Event.timestamp <= ?
+GROUP BY Event.songId
+ORDER BY totalTime DESC
+LIMIT 50;
+
+-- Most played artists in time range
+mostPlayedArtists:
+SELECT Artist.id, Artist.name, Artist.thumbnailUrl,
+       COUNT(Event.id) AS playCount, SUM(Event.playTime) AS totalTime
+FROM Event
+INNER JOIN SongArtistMap ON SongArtistMap.songId = Event.songId
+INNER JOIN Artist ON Artist.id = SongArtistMap.artistId
+WHERE Event.timestamp >= ? AND Event.timestamp <= ?
+GROUP BY Artist.id
+ORDER BY totalTime DESC
+LIMIT 50;
+
+-- Most played albums in time range
+mostPlayedAlbums:
+SELECT Album.id, Album.title, Album.thumbnailUrl, Album.year,
+       COUNT(Event.id) AS playCount, SUM(Event.playTime) AS totalTime
+FROM Event
+INNER JOIN Song ON Song.id = Event.songId
+INNER JOIN Album ON Album.id = Song.albumId
+WHERE Event.timestamp >= ? AND Event.timestamp <= ?
+GROUP BY Album.id
+ORDER BY totalTime DESC
+LIMIT 50;
+
+-- Aggregate stats for a time range
+getTotalPlayTimeInRange:
+SELECT COALESCE(SUM(playTime), 0) FROM Event WHERE timestamp >= ? AND timestamp <= ?;
+
+getUniqueSongCountInRange:
+SELECT COUNT(DISTINCT songId) FROM Event WHERE timestamp >= ? AND timestamp <= ?;
+
+getUniqueArtistCountInRange:
+SELECT COUNT(DISTINCT SongArtistMap.artistId)
+FROM Event
+INNER JOIN SongArtistMap ON SongArtistMap.songId = Event.songId
+WHERE Event.timestamp >= ? AND Event.timestamp <= ?;
